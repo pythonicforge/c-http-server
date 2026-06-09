@@ -4,6 +4,7 @@
 #include<unistd.h>
 #include<netinet/in.h>
 #include<string.h>
+#include "directory_reader.h"
 
 int main(){
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -33,8 +34,9 @@ int main(){
     exit(1);
   }
 
+  printf("Server running on http://localhost:8080\n");
+
   while(1){
-    printf("Connecting...\n");
     int client_fd = accept(server_fd, NULL, NULL);
 
     if(client_fd < 0){
@@ -43,21 +45,23 @@ int main(){
     }
 
     char buffer[4096];
+    recv(client_fd, buffer, sizeof(buffer) - 1, 0);
 
-    int bytes_received = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
+    char html[8192];
+    generate_directory_html("./shared", html, sizeof(html));
 
-    if(bytes_received > 0){
-      buffer[bytes_received] = '\0';
-      printf("%s\n", buffer);
+    char response[16384];
 
-    char *response = "HTTP/1.1 200 OK\r\n"
-      "\r\n"
-      "Hello World";
+    snprintf(response, sizeof(response), "HTTP/1.1 200 OK\r\n"
+        "Content=-Type: text/html\r\n"
+        "\r\n"
+        "%s",
+        html);
 
     send(client_fd, response, strlen(response), 0);
-    }
     close(client_fd);
   }
+
   close(server_fd);
   return 0;
 }
