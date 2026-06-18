@@ -277,7 +277,8 @@ static void generate_home_html(char *html, size_t max_size) {
     snprintf(html, max_size,
              "<html><body><h1>Shared Files</h1>"
              "<p>Could not open ./shared</p>"
-             "<form method=\"POST\" action=\"/upload\" enctype=\"multipart/form-data\">"
+             "<form method=\"POST\" action=\"/upload\" "
+             "enctype=\"multipart/form-data\">"
              "<input type=\"file\" name=\"file\">"
              "<button type=\"submit\">Upload</button>"
              "</form></body></html>");
@@ -287,7 +288,8 @@ static void generate_home_html(char *html, size_t max_size) {
   size_t used = 0;
   used += snprintf(html + used, max_size - used,
                    "<html><body><h1>Shared Files</h1>"
-                   "<form method=\"POST\" action=\"/upload\" enctype=\"multipart/form-data\">"
+                   "<form method=\"POST\" action=\"/upload\" "
+                   "enctype=\"multipart/form-data\">"
                    "<input type=\"file\" name=\"file\">"
                    "<button type=\"submit\">Upload</button>"
                    "</form>"
@@ -306,8 +308,8 @@ static void generate_home_html(char *html, size_t max_size) {
 
     if (used < max_size) {
       used += snprintf(html + used, max_size - used,
-                       "<li><a href=\"/download?file=%s\">%s</a></li>",
-                       encoded, escaped);
+                       "<li><a href=\"/download?file=%s\">%s</a></li>", encoded,
+                       escaped);
     }
   }
 
@@ -399,8 +401,9 @@ static void handle_upload(int client_fd, const char *headers, const char *body,
 
   char boundary[256];
   size_t bi = 0;
-  while (boundary_pos[bi] && boundary_pos[bi] != '\r' && boundary_pos[bi] != '\n' &&
-         boundary_pos[bi] != ';' && bi + 1 < sizeof(boundary)) {
+  while (boundary_pos[bi] && boundary_pos[bi] != '\r' &&
+         boundary_pos[bi] != '\n' && boundary_pos[bi] != ';' &&
+         bi + 1 < sizeof(boundary)) {
     boundary[bi] = boundary_pos[bi];
     bi++;
   }
@@ -411,7 +414,8 @@ static void handle_upload(int client_fd, const char *headers, const char *body,
   snprintf(first_boundary, sizeof(first_boundary), "--%s", boundary);
   snprintf(closing_boundary, sizeof(closing_boundary), "\r\n--%s", boundary);
 
-  const char *part = find_bytes(body, body_len, first_boundary, strlen(first_boundary));
+  const char *part =
+      find_bytes(body, body_len, first_boundary, strlen(first_boundary));
   if (!part) {
     send_simple_response(client_fd, "400 Bad Request", "text/plain",
                          "Boundary not found");
@@ -506,7 +510,8 @@ int main(void) {
   server_addr.sin_port = htons(PORT);
   server_addr.sin_addr.s_addr = INADDR_ANY;
 
-  if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+  if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) <
+      0) {
     perror("bind");
     close(server_fd);
     return 1;
