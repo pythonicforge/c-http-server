@@ -3,8 +3,8 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <netinet/in.h>
-#include <stdarg.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,9 +15,9 @@
 
 #define PORT 8080
 #define SHARED_DIR "./shared"
-#define MAX_REQUEST_SIZE (100 * 1024 * 1024)
+#define MAX_HEADER_SIZE (64 * 1024)
 #define MAX_HTML_SIZE 65536
-#define MAX_FILE_SIZE (100 * 1024 * 1024)
+#define MAX_UPLOAD_SIZE (1ULL << 60) /* effectively no fixed cap for normal use */
 
 #define MAX_NAME_LEN 256
 #define MAX_PATH_LEN 512
@@ -188,10 +188,43 @@ static void sanitize_filename(const char *in, char *out, size_t out_sz) {
   }
 }
 
-static size_t parse_content_length(const char *headers) {
+static bool get_query_param(const char *path, const char *key, char *out, size_t out_sz) {
+  const char *q = strchr(path, '?');
+  if (!q) {
+    return false;
+  }
+  q++;
+
+  size_t key_len = strlen(key);
+  while (*q) {
+    const char *amp = strchr(q, '&');
+    size_t pair_len = amp ? (size_t)(amp - q) : strlen(q);
+    const char *eq = memchr(q, '=', pair_len);
+
+    if (eq && (size_t)(eq - q) == key_len && memcmp(q, key, key_len) == 0) {
+      size_t val_len = pair_len - (size_t)(eq - q) - 1;
+      if (val_len >= out_sz) {
+        val_len = out_sz - 1;
+      }
+      memcpy(out, eq + 1, val_len);
+      out[val_len] = '\0';
+      url_decode_inplace(out);
+      return true;
+    }
+
+    if (!amp) {
+      break;
+    }
+    q = amp + 1;
+  }
+
+  return false;
+}
+
+static bool get_content_length(const char *headers, unsigned long long *out) {
   const char *p = strstr(headers, "Content-Length:");
   if (!p) {
-    return 0;
+    return false;
   }
 
   p += strlen("Content-Length:");
@@ -199,20 +232,17 @@ static size_t parse_content_length(const char *headers) {
     p++;
   }
 
-  return (size_t)strtoull(p, NULL, 10);
+  *out = strtoull(p, NULL, 10);
+  return true;
 }
 
-static int read_http_request(int client_fd, char **out_buf, size_t *out_len) {
+static int read_http_headers(int client_fd, char **out_buf, size_t *out_len) {
   size_t cap = 8192;
   size_t len = 0;
   char *buf = malloc(cap);
   if (!buf) {
     return -1;
   }
-
-  size_t header_end = 0;
-  size_t content_length = 0;
-  int have_headers = 0;
 
   while (1) {
     char tmp[4096];
@@ -243,29 +273,16 @@ static int read_http_request(int client_fd, char **out_buf, size_t *out_len) {
     memcpy(buf + len, tmp, (size_t)n);
     len += (size_t)n;
 
-    if (!have_headers) {
-      const char *end = find_bytes(buf, len, "\r\n\r\n", 4);
-      if (end) {
-        header_end = (size_t)(end - buf) + 4;
-        content_length = parse_content_length(buf);
-        have_headers = 1;
-
-        if (content_length == 0) {
-          break;
-        }
-        if (len >= header_end + content_length) {
-          break;
-        }
-      }
-    } else {
-      if (len >= header_end + content_length) {
-        break;
-      }
-    }
-
-    if (len > MAX_REQUEST_SIZE) {
+    if (len > MAX_HEADER_SIZE) {
       free(buf);
       return -1;
+    }
+
+    const char *end = find_bytes(buf, len, "\r\n\r\n", 4);
+    if (end) {
+      *out_buf = buf;
+      *out_len = len;
+      return 0;
     }
   }
 
@@ -433,22 +450,22 @@ static void generate_home_html(char *html, size_t max_size) {
   char total_used[64];
   char upload_limit[64];
   format_size((off_t)total_bytes, total_used, sizeof(total_used));
-  format_size((off_t)MAX_FILE_SIZE, upload_limit, sizeof(upload_limit));
+  format_size((off_t)MAX_UPLOAD_SIZE, upload_limit, sizeof(upload_limit));
 
   size_t used = 0;
   appendf(html, max_size, &used,
           "<html><body>"
-          "<h1>Shared Files</h1>"
+          "<h1>ShareIt</h1>"
           "<p><b>Host:</b> %s &nbsp; <b>Port:</b> %d</p>"
-          "<p><b>Files:</b> %zu &nbsp; <b>Used:</b> %s &nbsp; <b>Max upload per request:</b> %s</p>"
-          "<p>Select one or more files. The page shows the total selected size before upload.</p>"
-          "<form method=\"POST\" action=\"/upload\" enctype=\"multipart/form-data\">"
-          "<input type=\"file\" name=\"file\" id=\"fileInput\" multiple>"
-          "<button type=\"submit\">Upload</button>"
+          "<p><b>Files:</b> %zu &nbsp; <b>Used:</b> %s &nbsp;"
+          "<div>"
+          "<input type=\"file\" id=\"fileInput\" multiple>"
+          "<button id=\"uploadBtn\" type=\"button\">Upload selected files</button>"
           "<p id=\"selectedInfo\">No file selected</p>"
-          "</form>"
+          "<pre id=\"statusBox\">Idle</pre>"
+          "</div>"
           "<ul>",
-          host, PORT, file_count, total_used, upload_limit);
+          host, PORT, file_count, total_used);
 
   if (!opened) {
     appendf(html, max_size, &used,
@@ -472,7 +489,8 @@ static void generate_home_html(char *html, size_t max_size) {
       snprintf(delete_url, sizeof(delete_url), "/delete?file=%s", encoded_name);
 
       appendf(html, max_size, &used,
-              "<li><a href=\"%s\">%s</a> &nbsp; (%s, %s) &nbsp; <a href=\"%s\">delete</a></li>",
+              "<li><a href=\"%s\">%s</a> &nbsp; (%s, %s) &nbsp; "
+              "<a href=\"%s\" onclick=\"return confirm('Delete this file?')\">delete</a></li>",
               download_url, escaped_name, size_str, time_str, delete_url);
     }
   }
@@ -482,6 +500,8 @@ static void generate_home_html(char *html, size_t max_size) {
           "<script>"
           "const input = document.getElementById('fileInput');"
           "const info = document.getElementById('selectedInfo');"
+          "const statusBox = document.getElementById('statusBox');"
+          "const uploadBtn = document.getElementById('uploadBtn');"
           "input.addEventListener('change', () => {"
           "  let total = 0;"
           "  for (const f of input.files) total += f.size;"
@@ -489,6 +509,33 @@ static void generate_home_html(char *html, size_t max_size) {
           "    info.textContent = 'No file selected';"
           "  } else {"
           "    info.textContent = `${input.files.length} file(s) selected, ${(total / 1024 / 1024).toFixed(2)} MB total`;"
+          "  }"
+          "});"
+          "uploadBtn.addEventListener('click', async () => {"
+          "  const files = Array.from(input.files);"
+          "  if (files.length === 0) {"
+          "    statusBox.textContent = 'Pick at least one file first.';"
+          "    return;"
+          "  }"
+          "  uploadBtn.disabled = true;"
+          "  try {"
+          "    for (let i = 0; i < files.length; i++) {"
+          "      const f = files[i];"
+          "      statusBox.textContent = `Uploading ${i + 1}/${files.length}: ${f.name}`;"
+          "      const res = await fetch(`/upload?name=${encodeURIComponent(f.name)}`, {"
+          "        method: 'POST',"
+          "        headers: { 'Content-Type': 'application/octet-stream' },"
+          "        body: f"
+          "      });"
+          "      if (!res.ok) {"
+          "        throw new Error(await res.text());"
+          "      }"
+          "    }"
+          "    statusBox.textContent = 'Upload complete. Refreshing...';"
+          "    window.location.reload();"
+          "  } catch (err) {"
+          "    statusBox.textContent = `Upload failed: ${err.message}`;"
+          "    uploadBtn.disabled = false;"
           "  }"
           "});"
           "</script>"
@@ -532,18 +579,12 @@ static void build_unique_filepath(const char *directory, const char *name,
 }
 
 static void handle_download(int client_fd, const char *path) {
-  const char *file_param = strstr(path, "/download?file=");
-  if (!file_param) {
+  char filename[MAX_NAME_LEN] = "downloaded_file";
+  if (!get_query_param(path, "file", filename, sizeof(filename))) {
     send_simple_response(client_fd, "400 Bad Request", "text/plain",
                          "Bad download request");
     return;
   }
-
-  file_param += strlen("/download?file=");
-
-  char filename[MAX_NAME_LEN];
-  snprintf(filename, sizeof(filename), "%s", file_param);
-  url_decode_inplace(filename);
 
   char safe_name[MAX_NAME_LEN];
   sanitize_filename(filename, safe_name, sizeof(safe_name));
@@ -551,27 +592,17 @@ static void handle_download(int client_fd, const char *path) {
   char filepath[MAX_PATH_LEN];
   snprintf(filepath, sizeof(filepath), "%s/%s", SHARED_DIR, safe_name);
 
-  FILE *fp = fopen(filepath, "rb");
-  if (!fp) {
+  struct stat st;
+  if (stat(filepath, &st) != 0 || !S_ISREG(st.st_mode)) {
     send_simple_response(client_fd, "404 Not Found", "text/plain",
                          "File not found");
     return;
   }
 
-  if (fseek(fp, 0, SEEK_END) != 0) {
-    fclose(fp);
-    send_simple_response(client_fd, "500 Internal Server Error", "text/plain",
-                         "Could not read file");
-    return;
-  }
-
-  long fsize = ftell(fp);
-  rewind(fp);
-
-  if (fsize < 0) {
-    fclose(fp);
-    send_simple_response(client_fd, "500 Internal Server Error", "text/plain",
-                         "Could not read file");
+  FILE *fp = fopen(filepath, "rb");
+  if (!fp) {
+    send_simple_response(client_fd, "404 Not Found", "text/plain",
+                         "File not found");
     return;
   }
 
@@ -583,13 +614,13 @@ static void handle_download(int client_fd, const char *path) {
                    "Content-Length: %ld\r\n"
                    "Connection: close\r\n"
                    "\r\n",
-                   safe_name, fsize);
+                   safe_name, (long)st.st_size);
 
   if (n > 0) {
     send_all(client_fd, header, (size_t)n);
   }
 
-  char chunk[4096];
+  char chunk[8192];
   size_t bytes;
   while ((bytes = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
     send_all(client_fd, chunk, bytes);
@@ -599,18 +630,12 @@ static void handle_download(int client_fd, const char *path) {
 }
 
 static void handle_delete(int client_fd, const char *path) {
-  const char *file_param = strstr(path, "/delete?file=");
-  if (!file_param) {
+  char filename[MAX_NAME_LEN] = "deleted_file";
+  if (!get_query_param(path, "file", filename, sizeof(filename))) {
     send_simple_response(client_fd, "400 Bad Request", "text/plain",
                          "Bad delete request");
     return;
   }
-
-  file_param += strlen("/delete?file=");
-
-  char filename[MAX_NAME_LEN];
-  snprintf(filename, sizeof(filename), "%s", file_param);
-  url_decode_inplace(filename);
 
   char safe_name[MAX_NAME_LEN];
   sanitize_filename(filename, safe_name, sizeof(safe_name));
@@ -627,140 +652,82 @@ static void handle_delete(int client_fd, const char *path) {
   send_redirect(client_fd, "/");
 }
 
-static void handle_upload(int client_fd, const char *headers, const char *body,
-                          size_t body_len) {
-  const char *ct = strstr(headers, "Content-Type:");
-  if (!ct || !strstr(ct, "multipart/form-data")) {
-    send_simple_response(client_fd, "400 Bad Request", "text/plain",
-                         "Expected multipart/form-data");
+static void handle_raw_upload(int client_fd, const char *path, const char *headers,
+                              const char *body, size_t body_len) {
+  unsigned long long content_length = 0;
+  if (!get_content_length(headers, &content_length)) {
+    send_simple_response(client_fd, "411 Length Required", "text/plain",
+                         "Content-Length is required");
     return;
   }
 
-  const char *boundary_pos = strstr(ct, "boundary=");
-  if (!boundary_pos) {
-    send_simple_response(client_fd, "400 Bad Request", "text/plain",
-                         "Missing boundary");
+  if (content_length > MAX_UPLOAD_SIZE) {
+    send_simple_response(client_fd, "413 Payload Too Large", "text/plain",
+                         "File too large");
     return;
   }
 
-  boundary_pos += strlen("boundary=");
-
-  char boundary[256];
-  size_t bi = 0;
-  while (boundary_pos[bi] && boundary_pos[bi] != '\r' &&
-         boundary_pos[bi] != '\n' && boundary_pos[bi] != ';' &&
-         bi + 1 < sizeof(boundary)) {
-    boundary[bi] = boundary_pos[bi];
-    bi++;
+  char name[MAX_NAME_LEN] = "uploaded_file.bin";
+  if (!get_query_param(path, "name", name, sizeof(name))) {
+    snprintf(name, sizeof(name), "uploaded_file.bin");
   }
-  boundary[bi] = '\0';
 
-  char first_boundary[300];
-  char next_boundary[300];
-  snprintf(first_boundary, sizeof(first_boundary), "--%s", boundary);
-  snprintf(next_boundary, sizeof(next_boundary), "\r\n--%s", boundary);
-
-  const char *cursor = body;
-  size_t cursor_len = body_len;
-  int saved_files = 0;
+  char safe_name[MAX_NAME_LEN];
+  sanitize_filename(name, safe_name, sizeof(safe_name));
 
   mkdir(SHARED_DIR, 0755);
 
-  while (1) {
-    const char *part = find_bytes(cursor, cursor_len, first_boundary,
-                                  strlen(first_boundary));
-    if (!part) {
-      break;
-    }
+  char final_path[MAX_PATH_LEN];
+  build_unique_filepath(SHARED_DIR, safe_name, final_path, sizeof(final_path));
 
-    part += strlen(first_boundary);
-    size_t remaining = (size_t)((body + body_len) - part);
-
-    if (remaining >= 2 && part[0] == '-' && part[1] == '-') {
-      break;
-    }
-
-    if (remaining >= 2 && part[0] == '\r' && part[1] == '\n') {
-      part += 2;
-      remaining -= 2;
-    }
-
-    const char *part_headers_end = find_bytes(part, remaining, "\r\n\r\n", 4);
-    if (!part_headers_end) {
-      send_simple_response(client_fd, "400 Bad Request", "text/plain",
-                           "Invalid multipart body");
-      return;
-    }
-
-    const char *filename_pos = find_bytes(part, (size_t)(part_headers_end - part),
-                                          "filename=\"", 10);
-
-    const char *file_data = part_headers_end + 4;
-    size_t file_data_remaining = (size_t)((body + body_len) - file_data);
-    const char *boundary_hit = find_bytes(file_data, file_data_remaining,
-                                          next_boundary, strlen(next_boundary));
-    if (!boundary_hit) {
-      send_simple_response(client_fd, "400 Bad Request", "text/plain",
-                           "Could not find file end");
-      return;
-    }
-
-    size_t file_size = (size_t)(boundary_hit - file_data);
-    if (file_size >= 2 && file_data[file_size - 2] == '\r' &&
-        file_data[file_size - 1] == '\n') {
-      file_size -= 2;
-    }
-
-    if (filename_pos && filename_pos < part_headers_end) {
-      filename_pos += strlen("filename=\"");
-      char filename[MAX_NAME_LEN] = {0};
-      size_t i = 0;
-      while (filename_pos[i] && filename_pos[i] != '"' && i + 1 < sizeof(filename)) {
-        filename[i] = filename_pos[i];
-        i++;
-      }
-      filename[i] = '\0';
-
-      char safe_name[MAX_NAME_LEN];
-      sanitize_filename(filename, safe_name, sizeof(safe_name));
-
-      if (file_size == 0) {
-        cursor = boundary_hit + 2;
-        cursor_len = (size_t)((body + body_len) - cursor);
-        continue;
-      }
-
-      if (file_size > MAX_FILE_SIZE) {
-        send_simple_response(client_fd, "413 Payload Too Large", "text/plain",
-                             "File too large");
-        return;
-      }
-
-      char final_path[MAX_PATH_LEN];
-      build_unique_filepath(SHARED_DIR, safe_name, final_path, sizeof(final_path));
-
-      FILE *fp = fopen(final_path, "wb");
-      if (!fp) {
-        send_simple_response(client_fd, "500 Internal Server Error", "text/plain",
-                             "Could not save file");
-        return;
-      }
-
-      fwrite(file_data, 1, file_size, fp);
-      fclose(fp);
-      saved_files++;
-    }
-
-    cursor = boundary_hit + 2;
-    cursor_len = (size_t)((body + body_len) - cursor);
-  }
-
-  if (saved_files == 0) {
-    send_simple_response(client_fd, "400 Bad Request", "text/plain",
-                         "No files were uploaded");
+  FILE *fp = fopen(final_path, "wb");
+  if (!fp) {
+    send_simple_response(client_fd, "500 Internal Server Error", "text/plain",
+                         "Could not save file");
     return;
   }
 
+  size_t initial = body_len;
+  if ((unsigned long long)initial > content_length) {
+    initial = (size_t)content_length;
+  }
+
+  if (initial > 0) {
+    if (fwrite(body, 1, initial, fp) != initial) {
+      fclose(fp);
+      remove(final_path);
+      send_simple_response(client_fd, "500 Internal Server Error", "text/plain",
+                           "Could not save file");
+      return;
+    }
+  }
+
+  unsigned long long remaining = content_length - (unsigned long long)initial;
+  char chunk[8192];
+
+  while (remaining > 0) {
+    size_t want = remaining < sizeof(chunk) ? (size_t)remaining : sizeof(chunk);
+    ssize_t n = recv(client_fd, chunk, want, 0);
+    if (n <= 0) {
+      fclose(fp);
+      remove(final_path);
+      send_simple_response(client_fd, "400 Bad Request", "text/plain",
+                           "Upload interrupted");
+      return;
+    }
+
+    if (fwrite(chunk, 1, (size_t)n, fp) != (size_t)n) {
+      fclose(fp);
+      remove(final_path);
+      send_simple_response(client_fd, "500 Internal Server Error", "text/plain",
+                           "Could not save file");
+      return;
+    }
+
+    remaining -= (unsigned long long)n;
+  }
+
+  fclose(fp);
   send_redirect(client_fd, "/");
 }
 
@@ -804,7 +771,7 @@ int main(void) {
 
     char *request = NULL;
     size_t request_len = 0;
-    if (read_http_request(client_fd, &request, &request_len) < 0 || !request) {
+    if (read_http_headers(client_fd, &request, &request_len) < 0 || !request) {
       free(request);
       close(client_fd);
       continue;
@@ -840,16 +807,16 @@ int main(void) {
     if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0) {
       char html[MAX_HTML_SIZE];
       generate_home_html(html, sizeof(html));
-      send_simple_response(client_fd, "200 OK", "text/html; charset=utf-8",
-                           html);
+      send_simple_response(client_fd, "200 OK", "text/html; charset=utf-8", html);
     } else if (strcmp(method, "GET") == 0 &&
                strncmp(path, "/download?file=", 15) == 0) {
       handle_download(client_fd, path);
     } else if (strcmp(method, "GET") == 0 &&
                strncmp(path, "/delete?file=", 13) == 0) {
       handle_delete(client_fd, path);
-    } else if (strcmp(method, "POST") == 0 && strcmp(path, "/upload") == 0) {
-      handle_upload(client_fd, headers, body, body_len);
+    } else if ((strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0) &&
+               strncmp(path, "/upload", 7) == 0) {
+      handle_raw_upload(client_fd, path, headers, body, body_len);
     } else {
       send_simple_response(client_fd, "404 Not Found", "text/plain",
                            "Not found");
