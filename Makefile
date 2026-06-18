@@ -2,12 +2,11 @@ CC = gcc
 CFLAGS = -Wall -Wextra -std=c11
 
 TARGET = server
-
-SRCS = server.c directory_reader.c
+SRCS = server.c
 OBJS = $(SRCS:.c=.o)
 
 $(TARGET): $(OBJS)
-	$(CC) $(OBJS) -o $(TARGET)
+	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
